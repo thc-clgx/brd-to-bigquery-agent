@@ -1,0 +1,73 @@
+/****************************************************/
+/*  {{ table_00 }}.sql
+/*
+/*  BigQuery SQL script to ingest a rainfall source into a managed 00 table.
+/*  BRD             : {{ brd_file }} (SHA-256 {{ brd_sha256 }})
+/*  Template version : {{ template_version }}
+/*  Generated source : {{ feed_name }}
+/*
+/*  The external stage mirrors only CSV source fields. The managed 00 table
+/*  adds pipeline metadata after reading the source object.
+/*  DO NOT EXECUTE until the target, source objects, schema plan, and approval
+/*  summary have been reviewed.
+/****************************************************/
+
+CREATE OR REPLACE EXTERNAL TABLE `{{ project_id }}.{{ dataset_00 }}.{{ stage_table }}`
+(
+{%- for col in source_columns %}
+  {{ col.name }} {{ col.type }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+)
+OPTIONS (
+  allow_jagged_rows=false,
+  allow_quoted_newlines=false,
+  format="csv",
+  skip_leading_rows=1,
+  field_delimiter=",",
+  quote="\"",
+  uris=[{% for uri in source_uris %}"{{ uri | sql_string }}"{{ ", " if not loop.last else "" }}{% endfor %}]
+);
+
+CREATE TABLE IF NOT EXISTS `{{ project_id }}.{{ dataset_00 }}.{{ table_00 }}`
+(
+{%- for col in target_columns %}
+  {{ col.name }} {{ col.type }}{{ " NOT NULL" if not col.nullable else "" }} OPTIONS(description="{{ col.description | sql_string }}"){{ "," if not loop.last else "" }}
+{%- endfor %}
+)
+PARTITION BY {{ partition_field }}
+CLUSTER BY {{ cluster_fields | join(", ") }}
+OPTIONS (
+  description="{{ feed_name | sql_string }}; raw source feed with pipeline metadata."
+);
+
+{% for statement in alter_statements %}
+{{ statement }}
+{% endfor %}
+
+BEGIN TRANSACTION;
+
+DELETE FROM `{{ project_id }}.{{ dataset_00 }}.{{ table_00 }}`
+WHERE run_date = DATE '{{ run_date }}'
+  AND source_file_name IN ({% for name in source_file_names %}"{{ name | sql_string }}"{{ ", " if not loop.last else "" }}{% endfor %});
+
+INSERT INTO `{{ project_id }}.{{ dataset_00 }}.{{ table_00 }}`
+(
+{%- for col in target_columns %}
+  {{ col.name }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+)
+SELECT
+{%- for name in source_names %}
+  src.{{ name }} AS {{ name }},
+{%- endfor %}
+  CASE REGEXP_EXTRACT(src._FILE_NAME, r'[^/]+$')
+{%- for item in file_name_cases %}
+    WHEN "{{ item.staged_name | sql_string }}" THEN "{{ item.source_name | sql_string }}"
+{%- endfor %}
+    ELSE REGEXP_EXTRACT(src._FILE_NAME, r'[^/]+$')
+  END AS source_file_name,
+  TIMESTAMP '{{ ingested_at_utc }}' AS ingested_at,
+  DATE '{{ run_date }}' AS run_date
+FROM `{{ project_id }}.{{ dataset_00 }}.{{ stage_table }}` AS src;
+
+COMMIT TRANSACTION;

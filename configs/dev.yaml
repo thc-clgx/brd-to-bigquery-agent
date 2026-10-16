@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# Local DEV environment template for the BRD -> BigQuery agentic framework.
+#
+# The BRD is the source of truth for WHAT to build (project, bucket, datasets,
+# table names, schemas). Leave a value null to take it from the BRD.
+# Supply an approved project through the private local environment configuration.
+# ---------------------------------------------------------------------------
+
+environment: dev
+
+gcp:
+  # Set locally to the approved project; never commit credentials here.
+  project_id: null
+  location: US
+  # Authentication is resolved by google-auth in this order:
+  #   1. impersonate_service_account (if set)
+  #   2. GOOGLE_APPLICATION_CREDENTIALS env var
+  #   3. Application Default Credentials (gcloud auth application-default login)
+  #   4. Workload Identity (when running on GKE / Composer)
+  # NEVER put keys or secrets in this file.
+  impersonate_service_account: null
+
+gcs:
+  # Pinned: the BRD may not redirect uploads to another bucket.
+  bucket: null
+  # skip | overwrite | fail
+  overwrite_policy: fail
+
+bigquery:
+  # null -> taken from the BRD's "Data Sets:" section, so a new BRD needs no
+  # config change. Pin these only to force a specific target.
+  dataset_00: null
+  dataset_01: null
+  # 00 external tables are created with every column typed as STRING,
+  # matching the Core 00_CT_template.sql convention. Casting happens on 00 -> 01.
+  external_all_strings: true
+  external_table_options:
+    allow_jagged_rows: false
+    allow_quoted_newlines: false
+    format: csv
+    skip_leading_rows: 1
+    field_delimiter: ","
+    quote: ""
+
+pipeline:
+  # replace_run    -> DELETE the run_date partition, then INSERT (BRD requirement)
+  # append         -> INSERT only (not allowed for this BRD)
+  # truncate_table -> full table replace
+  rerun_strategy: replace_run
+  partition_field: run_date
+  run_identifier_field: run_date
+  load_date_field: LOAD_DATE_01
+  source_file_field: Source_FileName
+  source_format: xlsx
+  target_format: csv
+
+safety:
+  # Master safety switch. Nothing is written to GCS or BigQuery while true.
+  dry_run: true
+  # Human approval gate before any mutating action.
+  approval_required: true
+  approval_token: APPROVE_DEV_RUN
+  # DELETE statements are additionally gated behind explicit approval.
+  allow_destructive: false
+  # Hard block: this config may never target these projects.
+  forbidden_projects: []
+
+paths:
+  templates_dir: templates
+  generated_sql_dir: generated/sql
+  generated_specs_dir: generated/specs
+  generated_reports_dir: generated/reports
+  staging_csv_dir: generated/staging_csv
+
+llm:
+  # Off by default: the framework is fully deterministic until you opt in.
+  # Turn this on for BRDs that do not follow the structure the rule parser knows.
+  enabled: false
+
+  # rule_based - rules only, never calls a model (reproducible, zero cost)
+  # hybrid     - rules first; the model is called only when they fail  <- recommended
+  # llm        - the model extracts from scratch, rules act as a hint
+  extraction_mode: hybrid
+
+  # auto picks the first provider that has credentials in the environment:
+  # anthropic -> openai -> gemini -> copilot_cli.
+  # API keys are NEVER read from this file; they come from environment
+  # variables (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY).
+  provider: auto
+  model: ""
+  timeout_seconds: 300
+
+  # How many times the agent may repair its own spec after validation failures.
+  max_attempts: 3
+  # Decisions below this confidence are flagged for a human at the approval gate.
+  min_confidence: 0.7
+  max_document_chars: 60000
+  # Let the model resolve source headers that deterministic matching missed.
+  assist_header_mapping: true
+  # argv for the copilot_cli provider; "{prompt}" is substituted.
+  # Example: ["copilot", "-p", "{prompt}", "--allow-all-tools"]
+  cli_command: []
+
+file_prep:
+  # Columns that must stay STRING so leading zeros survive the xlsx -> csv hop.
+  leading_zero_columns:
+    - countyFIPSCode
+    - stateCode
+    - CntyCd
+    - GeoAddressPostcode
+    - PclId
+    - PclSeqNbr
+  # Header row is auto-detected; this caps how far down we look.
+  max_header_scan_rows: 20
+  csv_encoding: utf-8
+  # Must stay in sync with bigquery.external_table_options.quote
+  csv_quote_char: ""
+
+logging:
+  level: INFO

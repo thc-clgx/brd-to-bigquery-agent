@@ -1,0 +1,43 @@
+/****************************************************/
+/*  LOAD {{ table_00 }} -> {{ table_01 }}
+/*
+/*  Rerun strategy : {{ rerun_strategy }}
+/*  Run identifier : {{ run_id }} ({{ run_date }})
+/*  Generated      : {{ generated_at }}
+/*
+/*  DESTRUCTIVE: this script deletes the existing run_date partition
+/*  before inserting. It requires an explicit approval token to execute.
+/*
+/*  DO NOT EDIT BY HAND - regenerate from the pipeline spec.
+/****************************************************/
+
+BEGIN TRANSACTION;
+
+{% if rerun_strategy == "truncate_table" -%}
+TRUNCATE TABLE `{{ project_id }}.{{ dataset_01 }}.{{ table_01 }}`;
+{%- elif rerun_strategy == "replace_run" -%}
+DELETE FROM `{{ project_id }}.{{ dataset_01 }}.{{ table_01 }}`
+WHERE {{ partition_field }} = DATE '{{ run_date }}';
+{%- else -%}
+-- rerun_strategy = {{ rerun_strategy }}: no delete step, rows are appended.
+{%- endif %}
+
+INSERT INTO `{{ project_id }}.{{ dataset_01 }}.{{ table_01 }}`
+(
+{%- for col in columns %}
+  {{ col.name }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+)
+SELECT
+{%- for col in columns %}
+  {{ col.expr }} AS {{ col.name }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+FROM `{{ project_id }}.{{ dataset_00 }}.{{ table_00 }}` AS src
+{% if run_filter_expr -%}
+WHERE {{ run_filter_expr }} = DATE '{{ run_date }}';
+{%- else -%}
+-- The source file carries no run column, so every row belongs to this run.
+WHERE TRUE;
+{%- endif %}
+
+COMMIT TRANSACTION;

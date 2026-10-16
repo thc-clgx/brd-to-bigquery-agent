@@ -1,0 +1,12 @@
+-- Template: managed_table_v1
+-- BRD SHA-256: {{ brd_sha256 }}
+CREATE TABLE IF NOT EXISTS `{{ table_id }}`
+(
+{% for column in columns %}
+  `{{ column.name }}` {{ column.type }}{% if not column.nullable and not column.type.startswith('ARRAY<') %} NOT NULL{% endif %}{% if column.description %} OPTIONS(description="{{ column.description | sql_string }}"){% endif %}{% if not loop.last %},{% endif %}
+{% endfor %}
+)
+{% if partition_by %}PARTITION BY `{{ partition_by }}`
+{% endif %}
+{% if cluster_by %}CLUSTER BY {{ cluster_by | join(', ') }}
+{% endif %};

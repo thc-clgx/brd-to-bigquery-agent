@@ -1,0 +1,28 @@
+# Core
+pydantic>=2.6
+PyYAML>=6.0
+Jinja2>=3.1
+sqlglot>=27,<28
+eval-type-backport>=0.2.2; python_version < "3.10"
+
+# BRD reading
+python-docx>=1.1.0
+pypdf>=5.0,<7
+
+# File preparation
+pandas>=2.2
+openpyxl>=3.1
+
+# Google Cloud
+google-cloud-bigquery>=3.20
+google-cloud-storage>=2.16
+
+# Optional provider adapter, loaded only when LLM_PROVIDER=litellm
+litellm>=1.83.9
+
+# Testing
+pytest>=8.0
+
+# Airflow is intentionally NOT pinned here.
+# Install it separately in the Composer / Airflow environment:
+#   apache-airflow>=2.7

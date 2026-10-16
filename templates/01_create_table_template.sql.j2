@@ -1,0 +1,27 @@
+/****************************************************/
+/*  {{ table_01 }}.sql
+/*
+/*  Initial creation of the 01 managed table.
+/*  Generated from BRD: {{ brd_source }}
+/*  Source name : {{ source_name }}
+/*  Grain       : {{ grain }}
+/*  Generated   : {{ generated_at }}
+/*
+/*  DO NOT EDIT BY HAND - regenerate from the pipeline spec.
+/****************************************************/
+
+CREATE TABLE IF NOT EXISTS `{{ project_id }}.{{ dataset_01 }}.{{ table_01 }}`
+(
+{%- for col in columns %}
+  {{ col.name }} {{ col.type }}{{ " NOT NULL" if not col.nullable else "" }}{{ "," if not loop.last else "" }}{{ (" -- " ~ col.description) if col.description else "" }}
+{%- endfor %}
+)
+{%- if partition_by %}
+PARTITION BY {{ partition_by }}
+{%- endif %}
+{%- if cluster_by %}
+CLUSTER BY {{ cluster_by | join(", ") }}
+{%- endif %}
+OPTIONS (
+  description="01 table generated from BRD {{ brd_source | sql_string }} for source '{{ source_name | sql_string }}'. Partitioned by {{ partition_by }}; reruns replace the whole run."
+);

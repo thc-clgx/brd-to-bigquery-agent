@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+
+# Local environment settings and credentials
+.env
+.env.*
+!.env.example
+*credential*.json
+*credentials*.json
+service_account*.json
+*-service_account*.json
+service-account*.json
+*-service-account*.json
+*.pem
+*.key
+.secrets/
+generated/runtime_secrets/
+
+# Generated artifacts - regenerate from the BRD, never commit
+generated/
+logs/
+
+# Local BRDs and source files (may contain confidential/licensed data)
+input/
+inputs/
+data/
+BRD_auto_dummy_files/
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+*.docx
+*.pdf
+
+!.gitkeep

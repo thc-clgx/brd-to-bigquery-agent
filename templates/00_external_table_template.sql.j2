@@ -1,0 +1,27 @@
+/****************************************************/
+/*  {{ table_00 }}.sql
+/*
+/*  BigQuery SQL script to create the 00 external table.
+/*  Generated from BRD: {{ brd_source }}
+/*  Source name : {{ source_name }}
+/*  Grain       : {{ grain }}
+/*  Generated   : {{ generated_at }}
+/*
+/*  DO NOT EDIT BY HAND - regenerate from the pipeline spec.
+/****************************************************/
+
+CREATE OR REPLACE EXTERNAL TABLE `{{ project_id }}.{{ dataset_00 }}.{{ table_00 }}`
+(
+{%- for col in columns %}
+  {{ col.name }} {{ col.type }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+)
+OPTIONS (
+  allow_jagged_rows={{ options.allow_jagged_rows | lower }},
+  allow_quoted_newlines={{ options.allow_quoted_newlines | lower }},
+  format="{{ options.format }}",
+  skip_leading_rows={{ options.skip_leading_rows }},
+  field_delimiter="{{ options.field_delimiter }}",
+  quote="{{ options.quote }}",
+  uris=[{% for uri in uris %}'{{ uri }}'{{ ", " if not loop.last else "" }}{% endfor %}]
+);

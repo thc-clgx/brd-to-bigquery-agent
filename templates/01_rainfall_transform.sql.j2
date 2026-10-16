@@ -1,0 +1,219 @@
+-- Template: rainfall_01_v2
+-- BRD SHA-256: {{ brd_sha256 }}
+-- Run: {{ run_id }}
+-- Native 01 publication is atomic. No truncation, replacement, or deletion.
+
+CREATE TEMP TABLE selected_mapping AS
+SELECT *
+FROM `{{ project }}.{{ dataset_00 }}.00_watershed_station_map`
+WHERE run_date = (SELECT MAX(run_date) FROM `{{ project }}.{{ dataset_00 }}.00_watershed_station_map`);
+
+CREATE TEMP TABLE selected_thresholds AS
+SELECT *
+FROM `{{ project }}.{{ dataset_00 }}.00_flood_watch_thresholds`
+WHERE run_date = (SELECT MAX(run_date) FROM `{{ project }}.{{ dataset_00 }}.00_flood_watch_thresholds`);
+
+CREATE TEMP TABLE selected_observations AS
+SELECT * EXCEPT(winning_run)
+FROM (
+  SELECT *, MAX(run_date) OVER (PARTITION BY station_id, observation_date) AS winning_run
+  FROM `{{ project }}.{{ dataset_00 }}.00_rain_gauge_daily_observations`
+)
+WHERE run_date = winning_run;
+
+ASSERT (SELECT COUNT(*) > 0 FROM selected_mapping) AS 'BLOCKED: missing complete mapping snapshot';
+ASSERT (SELECT COUNT(*) > 0 FROM selected_thresholds) AS 'BLOCKED: missing complete threshold snapshot';
+ASSERT (SELECT COUNT(*) > 0 FROM selected_observations) AS 'BLOCKED: missing observations';
+ASSERT NOT EXISTS (
+  SELECT 1 FROM selected_observations
+  WHERE rainfall_mm IS NOT NULL AND SAFE_CAST(rainfall_mm AS BIGNUMERIC) IS NULL
+) AS 'FAILED: rainfall exceeds deterministic accumulation range';
+ASSERT (SELECT COUNT(DISTINCT ingested_at) = 1 FROM selected_mapping)
+  AS 'BLOCKED: multiple mapping snapshots tie on run_date';
+ASSERT (SELECT COUNT(DISTINCT ingested_at) = 1 FROM selected_thresholds)
+  AS 'BLOCKED: multiple threshold snapshots tie on run_date';
+ASSERT NOT EXISTS (
+  SELECT station_id, observation_date FROM selected_observations
+  GROUP BY station_id, observation_date HAVING COUNT(*) > 1
+) AS 'BLOCKED: observation winning-run key conflict';
+ASSERT NOT EXISTS (
+  SELECT watershed_id, station_id, effective_start_date FROM selected_mapping
+  GROUP BY watershed_id, station_id, effective_start_date HAVING COUNT(*) > 1
+) AS 'FAILED: duplicate mapping assignment key';
+ASSERT NOT EXISTS (
+  SELECT 1 FROM selected_mapping a JOIN selected_mapping b
+    ON a.station_id = b.station_id
+    AND TO_JSON_STRING(STRUCT(a.watershed_id, a.effective_start_date))
+      < TO_JSON_STRING(STRUCT(b.watershed_id, b.effective_start_date))
+    AND a.effective_start_date <= COALESCE(b.effective_end_date, DATE '9999-12-31')
+    AND b.effective_start_date <= COALESCE(a.effective_end_date, DATE '9999-12-31')
+) AS 'FAILED: ambiguous inclusive station assignment intervals';
+ASSERT NOT EXISTS (
+  SELECT 1 FROM selected_mapping a JOIN selected_mapping b
+    ON a.watershed_id = b.watershed_id
+    AND a.effective_start_date <= COALESCE(b.effective_end_date, DATE '9999-12-31')
+    AND b.effective_start_date <= COALESCE(a.effective_end_date, DATE '9999-12-31')
+  WHERE a.watershed_label != b.watershed_label OR a.region_code != b.region_code
+    OR a.watershed_area_km2 != b.watershed_area_km2
+) AS 'FAILED: inconsistent effective watershed attributes';
+ASSERT NOT EXISTS (
+  SELECT watershed_id, rolling_window_days, valid_from, valid_to
+  FROM selected_thresholds
+  GROUP BY watershed_id, rolling_window_days, valid_from, valid_to
+  HAVING COUNT(*) != 3 OR COUNT(DISTINCT severity_level) != 3
+    OR COUNT(DISTINCT minimum_station_coverage_pct) != 1
+    OR MAX(IF(severity_level = 'WATCH', rainfall_threshold_mm, NULL))
+      > MAX(IF(severity_level = 'WARNING', rainfall_threshold_mm, NULL))
+    OR MAX(IF(severity_level = 'WARNING', rainfall_threshold_mm, NULL))
+      > MAX(IF(severity_level = 'ALERT', rainfall_threshold_mm, NULL))
+) AS 'FAILED: incomplete or inconsistent severity threshold set';
+ASSERT NOT EXISTS (
+  SELECT 1 FROM selected_thresholds a JOIN selected_thresholds b
+    ON a.watershed_id = b.watershed_id AND a.rolling_window_days = b.rolling_window_days
+    AND a.severity_level = b.severity_level AND a.valid_from < b.valid_from
+    AND b.valid_from <= COALESCE(a.valid_to, DATE '9999-12-31')
+) AS 'FAILED: overlapping inclusive threshold intervals';
+ASSERT NOT EXISTS (
+  SELECT o.station_id, o.observation_date
+  FROM selected_observations o LEFT JOIN selected_mapping m
+    ON o.station_id = m.station_id AND o.observation_date >= m.effective_start_date
+    AND o.observation_date <= COALESCE(m.effective_end_date, DATE '9999-12-31')
+  GROUP BY o.station_id, o.observation_date HAVING COUNT(m.station_id) != 1
+) AS 'BLOCKED: observation must match exactly one effective assignment';
+
+CREATE TEMP TABLE build_dimension AS
+SELECT
+  watershed_id, watershed_label, region_code, station_id, station_latitude,
+  station_longitude, station_elevation_m, watershed_area_km2,
+  effective_start_date, effective_end_date, source_file_name,
+  ingested_at AS source_ingested_at, run_date AS source_run_date,
+  @transformed_at AS transformed_at
+FROM selected_mapping;
+
+CREATE TEMP TABLE build_daily AS
+SELECT
+  o.station_id, o.observation_date, m.watershed_id,
+  o.rainfall_mm, o.rainfall_duration_hours, o.peak_intensity_mm_per_hour,
+  o.quality_flag, o.source_updated_at, o.source_file_name,
+  o.ingested_at AS source_ingested_at, o.run_date AS source_run_date,
+  m.source_file_name AS mapping_source_file_name,
+  m.ingested_at AS mapping_ingested_at, m.run_date AS mapping_run_date,
+  @transformed_at AS transformed_at
+FROM selected_observations o
+JOIN selected_mapping m ON o.station_id = m.station_id
+  AND o.observation_date >= m.effective_start_date
+  AND o.observation_date <= COALESCE(m.effective_end_date, DATE '9999-12-31');
+
+CREATE TEMP TABLE build_coverage AS
+WITH dates AS (SELECT DISTINCT observation_date AS assessment_date FROM build_daily)
+SELECT
+  m.watershed_id, ANY_VALUE(m.watershed_label) AS watershed_label,
+  ANY_VALUE(m.region_code) AS region_code, d.assessment_date,
+  COUNT(DISTINCT m.station_id) AS expected_station_count,
+  COUNT(DISTINCT IF(o.quality_flag IN ('VALID', 'ESTIMATED')
+    AND o.rainfall_mm IS NOT NULL, o.station_id, NULL)) AS usable_station_count,
+  100.0 * SAFE_DIVIDE(COUNT(DISTINCT IF(o.quality_flag IN ('VALID', 'ESTIMATED')
+    AND o.rainfall_mm IS NOT NULL, o.station_id, NULL)),
+    COUNT(DISTINCT m.station_id)) AS station_coverage_pct,
+  ARRAY_AGG(DISTINCT o.source_file_name IGNORE NULLS ORDER BY o.source_file_name) AS observation_source_files,
+  ANY_VALUE(m.source_file_name) AS mapping_source_file_name,
+  ANY_VALUE(m.ingested_at) AS mapping_ingested_at,
+  ARRAY_AGG(DISTINCT o.source_run_date IGNORE NULLS ORDER BY o.source_run_date) AS observation_run_dates,
+  ARRAY_AGG(DISTINCT o.source_ingested_at IGNORE NULLS ORDER BY o.source_ingested_at) AS observation_ingested_at_values,
+  ANY_VALUE(m.run_date) AS mapping_run_date,
+  @run_date AS transform_run_date, @transformed_at AS transformed_at
+FROM dates d JOIN selected_mapping m
+  ON d.assessment_date >= m.effective_start_date
+  AND d.assessment_date <= COALESCE(m.effective_end_date, DATE '9999-12-31')
+LEFT JOIN build_daily o ON o.station_id = m.station_id
+  AND o.watershed_id = m.watershed_id AND o.observation_date = d.assessment_date
+GROUP BY m.watershed_id, d.assessment_date;
+
+CREATE TEMP TABLE build_assessment AS
+WITH windows AS (
+  SELECT
+    a.station_id, a.watershed_id, a.observation_date AS assessment_date,
+    window_days AS rolling_window_days,
+    IF(COUNTIF(o.quality_flag IN ('VALID', 'ESTIMATED') AND o.rainfall_mm IS NOT NULL) = window_days,
+      CAST(SUM(CAST(o.rainfall_mm AS BIGNUMERIC)) AS FLOAT64), NULL) AS rolling_rainfall_mm,
+    window_days AS expected_observation_days,
+    COUNTIF(o.quality_flag IN ('VALID', 'ESTIMATED') AND o.rainfall_mm IS NOT NULL) AS usable_observation_days,
+    COUNTIF(o.quality_flag = 'VALID') AS valid_observation_days,
+    COUNTIF(o.quality_flag = 'ESTIMATED') AS estimated_observation_days,
+    COUNTIF(o.quality_flag IN ('VALID', 'ESTIMATED') AND o.rainfall_mm IS NOT NULL) = window_days AS window_complete,
+    ARRAY_AGG(DISTINCT o.source_file_name IGNORE NULLS ORDER BY o.source_file_name) AS observation_source_files,
+    ANY_VALUE(a.mapping_source_file_name) AS mapping_source_file_name,
+    ANY_VALUE(a.mapping_ingested_at) AS mapping_ingested_at,
+    ARRAY_AGG(DISTINCT o.source_run_date IGNORE NULLS ORDER BY o.source_run_date) AS observation_run_dates,
+    ARRAY_AGG(DISTINCT o.source_ingested_at IGNORE NULLS ORDER BY o.source_ingested_at) AS observation_ingested_at_values,
+    ANY_VALUE(a.mapping_run_date) AS mapping_run_date
+  FROM build_daily a CROSS JOIN UNNEST([1, 3, 7]) AS window_days
+  LEFT JOIN build_daily o ON o.station_id = a.station_id
+    AND o.observation_date BETWEEN DATE_SUB(a.observation_date, INTERVAL (window_days - 1) DAY)
+      AND a.observation_date
+  GROUP BY a.station_id, a.watershed_id, a.observation_date, window_days
+), threshold_sets AS (
+  SELECT watershed_id, rolling_window_days, valid_from, valid_to,
+    ANY_VALUE(minimum_station_coverage_pct) AS minimum_station_coverage_pct,
+    MAX(IF(severity_level = 'WATCH', rainfall_threshold_mm, NULL)) AS watch_threshold_mm,
+    MAX(IF(severity_level = 'WARNING', rainfall_threshold_mm, NULL)) AS warning_threshold_mm,
+    MAX(IF(severity_level = 'ALERT', rainfall_threshold_mm, NULL)) AS alert_threshold_mm,
+    ANY_VALUE(source_file_name) AS threshold_source_file_name,
+    ANY_VALUE(ingested_at) AS threshold_ingested_at,
+    ANY_VALUE(run_date) AS threshold_run_date
+  FROM selected_thresholds
+  GROUP BY watershed_id, rolling_window_days, valid_from, valid_to
+)
+SELECT
+  w.station_id, w.watershed_id, w.assessment_date, w.rolling_window_days,
+  w.rolling_rainfall_mm, w.expected_observation_days, w.usable_observation_days,
+  w.valid_observation_days, w.estimated_observation_days, w.window_complete,
+  c.station_coverage_pct, t.minimum_station_coverage_pct,
+  t.watch_threshold_mm, t.warning_threshold_mm, t.alert_threshold_mm,
+  CASE
+    WHEN NOT w.window_complete THEN 'INCOMPLETE'
+    WHEN t.threshold_source_file_name IS NULL OR c.station_coverage_pct IS NULL
+      OR c.station_coverage_pct < t.minimum_station_coverage_pct THEN 'NOT_ASSESSED'
+    WHEN w.rolling_rainfall_mm < t.watch_threshold_mm THEN 'NO_THRESHOLD'
+    ELSE 'ASSESSED'
+  END AS assessment_status,
+  CASE
+    WHEN NOT w.window_complete OR t.threshold_source_file_name IS NULL
+      OR c.station_coverage_pct IS NULL
+      OR c.station_coverage_pct < t.minimum_station_coverage_pct THEN 'NOT_ASSESSED'
+    WHEN w.rolling_rainfall_mm >= t.alert_threshold_mm THEN 'ALERT'
+    WHEN w.rolling_rainfall_mm >= t.warning_threshold_mm THEN 'WARNING'
+    WHEN w.rolling_rainfall_mm >= t.watch_threshold_mm THEN 'WATCH'
+    ELSE 'NO_THRESHOLD'
+  END AS threshold_category,
+  w.observation_source_files, w.mapping_source_file_name, w.mapping_ingested_at,
+  t.threshold_source_file_name, t.threshold_ingested_at,
+  w.observation_run_dates, w.observation_ingested_at_values,
+  w.mapping_run_date, t.threshold_run_date,
+  @run_date AS transform_run_date, @transformed_at AS transformed_at
+FROM windows w
+JOIN build_coverage c ON c.watershed_id = w.watershed_id AND c.assessment_date = w.assessment_date
+LEFT JOIN threshold_sets t ON t.watershed_id = w.watershed_id
+  AND t.rolling_window_days = w.rolling_window_days AND w.assessment_date >= t.valid_from
+  AND w.assessment_date <= COALESCE(t.valid_to, DATE '9999-12-31');
+
+{{ validation_sql }}
+
+BEGIN TRANSACTION;
+-- A complete snapshot removing assignments needs a reviewed reconciliation;
+-- never silently retain stale assignments or delete historical target rows.
+ASSERT NOT EXISTS (
+  SELECT 1 FROM `{{ project }}.{{ dataset_01 }}.01_dim_station_watershed` t
+  WHERE NOT EXISTS (SELECT 1 FROM build_dimension s
+    WHERE t.watershed_id = s.watershed_id AND t.station_id = s.station_id
+      AND t.effective_start_date = s.effective_start_date)
+) AS 'BLOCKED: snapshot removes dimension keys; explicit reconciliation required';
+
+{{ merge_sql }}
+
+COMMIT TRANSACTION;
+
+SELECT '01_dim_station_watershed' AS table_name, COUNT(*) AS row_count FROM build_dimension
+UNION ALL SELECT '01_fact_daily_station_rainfall', COUNT(*) FROM build_daily
+UNION ALL SELECT '01_fact_watershed_station_coverage', COUNT(*) FROM build_coverage
+UNION ALL SELECT '01_fact_station_rainfall_assessment', COUNT(*) FROM build_assessment;
