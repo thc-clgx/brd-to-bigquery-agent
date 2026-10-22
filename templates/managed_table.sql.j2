@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS `{{ table_id }}`
   `{{ column.name }}` {{ column.type }}{% if not column.nullable and not column.type.startswith('ARRAY<') %} NOT NULL{% endif %}{% if column.description %} OPTIONS(description="{{ column.description | sql_string }}"){% endif %}{% if not loop.last %},{% endif %}
 {% endfor %}
 )
-{% if partition_by %}PARTITION BY `{{ partition_by }}`
+{% if partition_by %}PARTITION BY {% if partition_granularity | default('DAY') == 'MONTH' %}DATE_TRUNC(`{{ partition_by }}`, MONTH){% else %}`{{ partition_by }}`{% endif %}
 {% endif %}
 {% if cluster_by %}CLUSTER BY {{ cluster_by | join(', ') }}
 {% endif %};

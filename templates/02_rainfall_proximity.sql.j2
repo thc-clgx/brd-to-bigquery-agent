@@ -1,0 +1,24 @@
+WITH eligible AS (
+  SELECT a.station_id, a.watershed_id, c.watershed_label, c.region_code, a.assessment_date,
+    a.rolling_window_days, a.rolling_rainfall_mm, a.threshold_category,
+    a.watch_threshold_mm, a.warning_threshold_mm, a.alert_threshold_mm,
+    ROUND(100.0 * a.rolling_rainfall_mm / a.alert_threshold_mm, 2) AS pct_of_alert_threshold,
+    ROUND(a.alert_threshold_mm - a.rolling_rainfall_mm, 2) AS gap_to_alert_mm,
+    c.station_coverage_pct, a.transform_run_date AS assessment_transform_run_date
+  FROM `{{ project }}.{{ dataset_01 }}.01_fact_station_rainfall_assessment` a
+  JOIN `{{ project }}.{{ dataset_01 }}.01_fact_watershed_station_coverage` c
+    USING (watershed_id, assessment_date)
+  WHERE a.assessment_date IN UNNEST(@affected_dates) AND a.window_complete
+    AND a.assessment_status IN ('ASSESSED', 'NO_THRESHOLD') AND a.rolling_rainfall_mm IS NOT NULL
+    AND a.alert_threshold_mm > 0 AND a.threshold_category <> 'ALERT'
+), ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY assessment_date, rolling_window_days
+    ORDER BY pct_of_alert_threshold DESC, gap_to_alert_mm ASC, station_id ASC) AS alert_proximity_rank
+  FROM eligible
+)
+SELECT station_id, watershed_id, watershed_label, region_code, assessment_date, rolling_window_days,
+  rolling_rainfall_mm, threshold_category, watch_threshold_mm, warning_threshold_mm, alert_threshold_mm,
+  pct_of_alert_threshold, gap_to_alert_mm, station_coverage_pct, alert_proximity_rank,
+  alert_proximity_rank <= 3 AS top_3_flag, assessment_transform_run_date,
+  @run_date AS transform_run_date, @transformed_at AS transformed_at
+FROM ranked

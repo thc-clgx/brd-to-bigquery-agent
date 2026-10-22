@@ -199,6 +199,8 @@ LEFT JOIN threshold_sets t ON t.watershed_id = w.watershed_id
 
 {{ validation_sql }}
 
+{{ scope_capture | default('') }}
+
 BEGIN TRANSACTION;
 -- A complete snapshot removing assignments needs a reviewed reconciliation;
 -- never silently retain stale assignments or delete historical target rows.
@@ -210,6 +212,8 @@ ASSERT NOT EXISTS (
 ) AS 'BLOCKED: snapshot removes dimension keys; explicit reconciliation required';
 
 {{ merge_sql }}
+
+{{ scope_publication | default('') }}
 
 COMMIT TRANSACTION;
 

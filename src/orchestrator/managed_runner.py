@@ -26,6 +26,7 @@ from ..rainfall.executor import (
 from ..rainfall.preflight import authentication_guidance, verify_workload_identity
 from ..rainfall.processing import make_run_identity, sha256_file
 from ..sql_generator.render_template import SqlRenderer, write_sql
+from ..sql_generator.dsp import compile_dsp_publication
 from ..utils.config import PROJECT_ROOT
 from .automatic_runner import validate_value
 from .managed_contract import ManagedContract, ManagedTable, propose_contract
@@ -121,7 +122,7 @@ def compile_publication(contract: ManagedContract) -> str:
     builds, merges = [], []
     temp_names = {table.table_id: f"build_{index}" for index, table in enumerate(contract.tables) if table.layer == "01"}
     for table in contract.tables:
-        if table.layer == "00":
+        if table.layer != "01":
             continue
         tree = parse_one(table.select_sql, read="bigquery")
         for reference in tree.find_all(exp.Table):
@@ -210,7 +211,9 @@ def execute_generic(
         for table in contract.tables:
             target = bigquery.Table(table.table_id, schema=[field_schema(column) for column in table.columns])
             if table.partition_by:
-                target.time_partitioning = bigquery.TimePartitioning(field=table.partition_by)
+                target.time_partitioning = bigquery.TimePartitioning(
+                    field=table.partition_by, type_=table.partition_granularity,
+                )
             target.clustering_fields = table.cluster_by or None
             target.labels = LABELS
             try:
@@ -224,6 +227,7 @@ def execute_generic(
                 "table_id": table.table_id, "brd_sha256": report["brd_sha256"],
                 "columns": [column.model_dump() for column in table.columns],
                 "partition_by": table.partition_by, "cluster_by": table.cluster_by,
+                "partition_granularity": table.partition_granularity,
             })
             write_sql(sql, output_root / "sql" / table.layer, target.table_id + ".sql")
         datasets = {table.table_id.rsplit(".", 1)[0] for table in contract.tables}
@@ -246,6 +250,10 @@ def execute_generic(
             raise ContractBlocked("Bucket does not meet required location/private-access protections.")
         transform = compile_publication(contract)
         write_sql(transform, output_root / "sql" / "01", f"managed_transform_{run_id}.sql")
+        kpi_tables = [table for table in contract.tables if table.layer == "02"]
+        kpi_transform = compile_dsp_publication(kpi_tables) if kpi_tables else None
+        if kpi_transform:
+            write_sql(kpi_transform, output_root / "sql" / "02", f"managed_kpi_{run_id}.sql")
         report["steps"].append({"step": phase, "actor": "Python/GCP read-only inspection", "status": "PASS"})
         if dry_run:
             report["status"] = "DRY_RUN_READY"
@@ -319,6 +327,16 @@ def execute_generic(
         ))
         job.result()
         report["jobs"].append({"phase": "01", "job_id": job.job_id})
+        if kpi_transform:
+            phase = "02 DSP staging, validation and atomic publication"
+            job_02 = bq.query(kpi_transform, job_config=bigquery.QueryJobConfig(
+                query_parameters=params, maximum_bytes_billed=1024**3, labels=LABELS,
+            ))
+            report["kpi_validation_failures"] = [dict(row) for row in job_02.result()]
+            report["jobs"].append({"phase": "02", "job_id": job_02.job_id})
+            if report["kpi_validation_failures"]:
+                raise ContractBlocked("02 publication blocked; see keyed validation diagnostics.")
+            report["steps"].append({"step": phase, "actor": "Python/BigQuery DSP CLI adaptation", "status": "PASS"})
         for table, target, _ in wanted:
             actual = bq.get_table(target)
             schema_actions(actual, target, allow_nullable_additions=False)
@@ -328,6 +346,10 @@ def execute_generic(
             report["idempotency_verification"] = verify_unchanged_retry(
                 bq, transform, params, sum(table.layer == "01" for table in contract.tables),
             )
+            if kpi_transform:
+                report["idempotency_verification_02"] = verify_unchanged_retry(
+                    bq, kpi_transform, params, len(kpi_tables),
+                )
         report["status"] = "SUCCESS"
         write_report(report, directory)
         for name, content_type in (("run_report.md", "text/markdown"), ("run_report.json", "application/json")):

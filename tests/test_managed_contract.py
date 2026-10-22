@@ -96,6 +96,36 @@ def test_generic_contract_does_not_assume_rainfall_names():
     assert "DROP" not in sql and "TRUNCATE" not in sql
 
 
+def test_generic_02_optional_contract_has_closed_dependencies_and_separate_transaction():
+    value = contract()
+    date_column = ContractField(
+        name="assessment_date", type="DATE", nullable=False,
+        description="Assessment date", evidence_quote="assessment_date DATE required",
+    )
+    value.tables[1].columns.append(date_column)
+    value.tables[1].select_sql = f"SELECT station, amount, @run_date AS assessment_date FROM `{RAW}`"
+    kpi = ManagedTable(
+        table_id=CURATED.replace("sample_01.01_", "sample_02.02_"), layer="02",
+        columns=value.tables[1].columns, business_keys=["station", "assessment_date"],
+        partition_by="assessment_date", cluster_by=["station"], dependencies=[CURATED],
+        select_sql=f"SELECT station, amount, assessment_date FROM `{CURATED}`",
+        evidence_quote="02_readings copies the published curated table.",
+    )
+    value.tables.append(kpi)
+    evidence = document()
+    evidence.lines[0].text += (
+        f"\n{kpi.table_id}\nassessment_date DATE required\n"
+        "02_readings copies the published curated table."
+    )
+    validate_contract(value, evidence)
+    assert f"MERGE `{kpi.table_id}`" not in compile_publication(value)
+    from src.sql_generator.dsp import compile_dsp_publication
+    assert f"MERGE `{kpi.table_id}`" in compile_dsp_publication([kpi])
+    kpi.dependencies = [RAW]
+    with pytest.raises(ValueError, match="only published 01"):
+        validate_contract(value, evidence)
+
+
 def test_generic_llm_contract_is_compiled_only_after_deterministic_validation():
     provider = EchoProvider(responses=[contract().model_dump_json()])
     result, response = propose_contract(document(), provider)

@@ -1,0 +1,24 @@
+-- Template: {{ template_version }}
+-- DSP 3.2.0 CLI ADAPTATION, not an unmodified DSP deployment.
+-- No Pub/Sub metadata, HPI placeholders, persistent staging, dynamic casts or truncation.
+-- Step 0: Initialize the approved run and affected scope.
+{{ initialization }}
+
+-- Step 1: Materialize dependency-ordered temporary staging.
+{{ build_sql }}
+
+-- Step 2: Data quality. Only controlled key/rule diagnostics leave this script.
+CREATE TEMP TABLE kpi_validation_failures AS
+{{ checks_sql }};
+
+{{ validation_sql }}
+
+-- Step 3 / 99: Publish every validated KPI and acknowledge its scope atomically.
+IF NOT EXISTS (SELECT 1 FROM kpi_validation_failures) THEN
+  BEGIN TRANSACTION;
+  {{ merge_sql }}
+  {{ audit_sql }}
+  COMMIT TRANSACTION;
+END IF;
+
+SELECT table_name, business_key, rule, observed_value FROM kpi_validation_failures;

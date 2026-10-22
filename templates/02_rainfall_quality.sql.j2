@@ -1,0 +1,50 @@
+WITH expected AS (
+  SELECT d.station_id, d.watershed_id, DATE_TRUNC(c.assessment_date, MONTH) AS month_start_date,
+    COUNT(DISTINCT c.assessment_date) AS expected_observation_days,
+    ARRAY_AGG(STRUCT(d.watershed_label, d.region_code) ORDER BY d.effective_start_date DESC LIMIT 1)[OFFSET(0)] AS labels
+  FROM `{{ project }}.{{ dataset_01 }}.01_dim_station_watershed` d
+  JOIN `{{ project }}.{{ dataset_01 }}.01_fact_watershed_station_coverage` c
+    ON c.watershed_id = d.watershed_id AND c.assessment_date >= d.effective_start_date
+    AND c.assessment_date <= COALESCE(d.effective_end_date, DATE '9999-12-31')
+  WHERE DATE_TRUNC(c.assessment_date, MONTH) IN UNNEST(@affected_months)
+  GROUP BY d.station_id, d.watershed_id, month_start_date
+), received AS (
+  SELECT station_id, watershed_id, DATE_TRUNC(observation_date, MONTH) AS month_start_date,
+    COUNT(*) AS received_observation_days,
+    COUNTIF(quality_flag = 'VALID') AS valid_observation_days,
+    COUNTIF(quality_flag = 'ESTIMATED') AS estimated_observation_days,
+    COUNTIF(quality_flag = 'MISSING') AS missing_observation_days,
+    COUNTIF(quality_flag IN ('VALID', 'ESTIMATED') AND rainfall_mm IS NOT NULL) AS usable_observation_days,
+    CAST(SUM(IF(quality_flag IN ('VALID', 'ESTIMATED') AND rainfall_mm IS NOT NULL,
+      CAST(rainfall_mm AS BIGNUMERIC), NULL)) AS FLOAT64) AS station_reported_rainfall_mm,
+    MAX(IF(quality_flag IN ('VALID', 'ESTIMATED'), rainfall_mm, NULL)) AS max_daily_rainfall_mm,
+    MIN(observation_date) AS first_observation_date, MAX(observation_date) AS last_observation_date,
+    MAX(transformed_at) AS source_daily_transformed_at
+  FROM `{{ project }}.{{ dataset_01 }}.01_fact_daily_station_rainfall`
+  WHERE DATE_TRUNC(observation_date, MONTH) IN UNNEST(@affected_months)
+  GROUP BY station_id, watershed_id, month_start_date
+), measures AS (
+  SELECT e.*, IFNULL(r.received_observation_days, 0) AS received_observation_days,
+    e.expected_observation_days - IFNULL(r.received_observation_days, 0) AS absent_observation_days,
+    IFNULL(r.valid_observation_days, 0) AS valid_observation_days,
+    IFNULL(r.estimated_observation_days, 0) AS estimated_observation_days,
+    IFNULL(r.missing_observation_days, 0) AS missing_observation_days,
+    IFNULL(r.usable_observation_days, 0) AS usable_observation_days,
+    ROUND(100.0 * SAFE_DIVIDE(IFNULL(r.usable_observation_days, 0), e.expected_observation_days), 2) AS reporting_reliability_pct,
+    ROUND(100.0 * SAFE_DIVIDE(r.estimated_observation_days, r.usable_observation_days), 2) AS estimated_observation_pct,
+    r.station_reported_rainfall_mm, r.max_daily_rainfall_mm, r.first_observation_date,
+    r.last_observation_date, r.source_daily_transformed_at
+  FROM expected e LEFT JOIN received r USING (station_id, watershed_id, month_start_date)
+), bands AS (
+  SELECT *, CASE WHEN reporting_reliability_pct >= 95 THEN 'GOOD'
+    WHEN reporting_reliability_pct >= 80 THEN 'FAIR' WHEN reporting_reliability_pct IS NULL THEN 'NO_EXPECTED_DAYS'
+    ELSE 'POOR' END AS data_quality_band FROM measures
+)
+SELECT station_id, watershed_id, labels.watershed_label AS watershed_label, labels.region_code AS region_code,
+  month_start_date, expected_observation_days, received_observation_days, absent_observation_days,
+  valid_observation_days, estimated_observation_days, missing_observation_days, usable_observation_days,
+  reporting_reliability_pct, estimated_observation_pct, data_quality_band,
+  data_quality_band = 'GOOD' AS reliable_station_flag, station_reported_rainfall_mm, max_daily_rainfall_mm,
+  first_observation_date, last_observation_date, source_daily_transformed_at,
+  @run_date AS transform_run_date, @transformed_at AS transformed_at
+FROM bands

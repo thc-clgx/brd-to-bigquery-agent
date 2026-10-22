@@ -1,0 +1,27 @@
+WITH grouped AS (
+  SELECT watershed_id, DATE_TRUNC(assessment_date, MONTH) AS month_start_date, rolling_window_days,
+    ARRAY_AGG(STRUCT(watershed_label, region_code) ORDER BY assessment_date DESC LIMIT 1)[OFFSET(0)] AS labels,
+    COUNT(*) AS calendar_days_in_scope, COUNTIF(assessment_row_count > 0) AS assessment_days,
+    COUNTIF(highest_threshold_category = 'NO_ASSESSMENT_ROW') AS no_assessment_row_days,
+    COUNTIF(highest_threshold_category = 'NOT_ASSESSED') AS not_assessed_days,
+    COUNTIF(highest_threshold_category = 'NO_THRESHOLD') AS no_threshold_days,
+    COUNTIF(highest_threshold_category = 'WATCH') AS watch_days,
+    COUNTIF(highest_threshold_category = 'WARNING') AS warning_days,
+    COUNTIF(highest_threshold_category = 'ALERT') AS alert_days,
+    COUNTIF(highest_threshold_category IN ('WATCH', 'WARNING', 'ALERT')) AS threshold_exceedance_days,
+    COUNTIF(coverage_below_minimum_flag) AS coverage_below_minimum_days,
+    MIN(IF(highest_threshold_category IN ('WATCH', 'WARNING', 'ALERT'), assessment_date, NULL)) AS first_exceedance_date,
+    MAX(IF(highest_threshold_category IN ('WATCH', 'WARNING', 'ALERT'), assessment_date, NULL)) AS last_exceedance_date,
+    CAST(ROUND(AVG(CAST(station_coverage_pct AS BIGNUMERIC)), 2) AS FLOAT64) AS average_station_coverage_pct,
+    MAX(max_station_rolling_rainfall_mm) AS max_station_rolling_rainfall_mm,
+    MAX(transform_run_date) AS source_status_transform_run_date
+  FROM `{{ project }}.{{ dataset_02 }}.02_watershed_daily_rainfall_status`
+  GROUP BY watershed_id, month_start_date, rolling_window_days
+)
+SELECT watershed_id, labels.watershed_label AS watershed_label, labels.region_code AS region_code,
+  month_start_date, rolling_window_days, calendar_days_in_scope, assessment_days, no_assessment_row_days,
+  not_assessed_days, no_threshold_days, watch_days, warning_days, alert_days, threshold_exceedance_days,
+  coverage_below_minimum_days, first_exceedance_date, last_exceedance_date,
+  average_station_coverage_pct, max_station_rolling_rainfall_mm, source_status_transform_run_date,
+  @run_date AS transform_run_date, @transformed_at AS transformed_at
+FROM grouped

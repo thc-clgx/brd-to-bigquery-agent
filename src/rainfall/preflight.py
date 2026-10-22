@@ -80,7 +80,7 @@ def development_resources(document: BrdDocument) -> dict[str, str]:
         "00 dataset",
         "01 dataset",
     }
-    optional = {"Pipeline service account"}
+    optional = {"Pipeline service account", "02 dataset"}
     resources: dict[str, str] = {}
     for rows in document.tables:
         if not rows or rows[0][:2] != ["Resource", "Development value"]:
@@ -99,7 +99,7 @@ def development_resources(document: BrdDocument) -> dict[str, str]:
         raise ValueError("Invalid BRD Google Cloud project identifier.")
     if resources["Runtime region"] != "us-central1":
         raise ValueError("Unsupported DEV runtime region.")
-    for key in ("00 dataset", "01 dataset"):
+    for key in ("00 dataset", "01 dataset", *(["02 dataset"] if "02 dataset" in resources else [])):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", resources[key]):
             raise ValueError("Invalid BRD dataset identifier.")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]", resources["GCS landing bucket"]):
@@ -111,6 +111,24 @@ def development_resources(document: BrdDocument) -> dict[str, str]:
     ):
         raise ValueError("Invalid BRD workload identity.")
     return resources
+
+
+def approved_bucket(resources: dict[str, str]) -> tuple[str, dict | None]:
+    """Bind a reviewed DEV naming override to its original project and BRD bucket."""
+    original = resources["GCS landing bucket"]
+    override = os.getenv("GCS_LANDING_BUCKET_OVERRIDE")
+    if not override or override == original:
+        return original, None
+    approval = f"APPROVE_DEV:{resources['Google Cloud project ID']}:{original}:{override}"
+    if resources["Environment"] != "dev" or os.getenv("GCS_BUCKET_OVERRIDE_APPROVAL") != approval:
+        raise ValueError("Bucket override requires a matching explicit DEV deployment approval.")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]", override):
+        raise ValueError("Invalid approved bucket override.")
+    return override, {
+        "decision": "Approved DEV bucket-name override; business rules and BRD remain unchanged.",
+        "brd_bucket": original, "deployment_bucket": override,
+        "project": resources["Google Cloud project ID"],
+    }
 
 
 def extract_curated_contracts(document: BrdDocument) -> list[CuratedTable]:
@@ -141,6 +159,11 @@ def extract_curated_contracts(document: BrdDocument) -> list[CuratedTable]:
                 name=row[0], type=row[1], nullable=row[2] == "Yes", definition=row[3],
             ))
         names = {column.name for column in columns}
+        if any(name in names for name in (
+            "minimum_coverage_source", "reporting_reliability_pct", "calendar_days_in_scope",
+            "alert_proximity_rank",
+        )):
+            continue
         matches = [name for signature, name in signatures.items() if signature in names]
         if len(matches) != 1 or matches[0] in result:
             raise ValueError("Ambiguous or duplicated curated schema table.")

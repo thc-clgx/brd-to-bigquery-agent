@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,10 @@ from ..sql_generator.render_template import SqlRenderer, write_sql
 from ..utils.config import PROJECT_ROOT
 from .execution_plan import OPERATIONS, compile_transform_sql, propose_execution_plan
 from .acceptance import verify_analytical_examples
-from .preflight import authentication_guidance, development_resources, extract_curated_contracts, verify_workload_identity
+from .preflight import (
+    approved_bucket, authentication_guidance, development_resources,
+    extract_curated_contracts, verify_workload_identity,
+)
 from .processing import (
     discover_source_files, extract_pipeline_contract, inspect_sources, make_run_identity, sha256_file,
 )
@@ -43,7 +47,8 @@ class ContractBlocked(ValueError):
 def field_schema(column) -> bigquery.SchemaField:
     if column.type.startswith("ARRAY<"):
         return bigquery.SchemaField(
-            column.name, column.type[6:-1], mode="REPEATED", description=column.definition,
+            column.name, column.type[6:-1], mode="REPEATED",
+            description=getattr(column, "description", None) or getattr(column, "definition", None),
         )
     return bigquery.SchemaField(
         column.name, column.type, mode="NULLABLE" if column.nullable else "REQUIRED",
@@ -71,6 +76,8 @@ def schema_actions(
     new_partition = wanted.time_partitioning.field if wanted.time_partitioning else None
     if old_partition != new_partition or (existing.clustering_fields or []) != (wanted.clustering_fields or []):
         raise ContractBlocked(f"{existing.table_id}: existing partitioning/clustering conflicts with BRD.")
+    if existing.time_partitioning and existing.time_partitioning.type_ != wanted.time_partitioning.type_:
+        raise ContractBlocked(f"{existing.table_id}: existing partition granularity conflicts with BRD.")
     return additions
 
 
@@ -228,6 +235,26 @@ def write_report(report: dict, directory: Path) -> None:
     lines.extend(["", "## Verified row counts", "", "| Table | Rows |", "| --- | ---: |"])
     for name, count in report.get("row_counts", {}).items():
         lines.append(f"| {name} | {count} |")
+    if report.get("verification"):
+        lines.extend(["", "## Additional acceptance verification", "",
+                      "| Check | Result | Evidence |", "| --- | --- | --- |"])
+        for item in report["verification"]:
+            values = [str(item[field]).replace("|", "/").replace("\n", " ")
+                      for field in ("check", "result", "evidence")]
+            lines.append("| " + " | ".join(values) + " |")
+    if report.get("kpi_validation_failures"):
+        lines.extend(["", "## 02 validation failures", "",
+                      "| Table | Business key | Rule | Observed value |", "| --- | --- | --- | --- |"])
+        for item in report["kpi_validation_failures"]:
+            values = [str(item[field]).replace("|", "/").replace("\n", " ")
+                      for field in ("table_name", "business_key", "rule", "observed_value")]
+            lines.append("| " + " | ".join(values) + " |")
+    if report.get("deployment_decisions"):
+        lines.extend(["", "## Explicit deployment decisions", "",
+                      "```json", json.dumps(report["deployment_decisions"], indent=2), "```"])
+    if report.get("kpi_scope"):
+        lines.extend(["", "## 02 affected scope", "",
+                      "```json", json.dumps(report["kpi_scope"], indent=2, default=str), "```"])
     lines.extend([
         "", "## Execution scope", "",
         "This report describes a CLI batch execution. No deployed object-finalized trigger is claimed.",
@@ -270,8 +297,27 @@ def execute(
             )
         target = resources.get("Pipeline service account")
         if target:
-            raise ContractBlocked("This executor requires ADC; an explicit impersonation contract needs configuration.")
+            approval = f"APPROVE_DEV_ADC:{resources['Google Cloud project ID']}:{target}"
+            if os.getenv("BRD_SERVICE_ACCOUNT_OVERRIDE") != approval:
+                raise ContractBlocked(
+                    "BRD specifies a service account. Configure its impersonation, or explicitly approve "
+                    "the project/account-bound DEV ADC override; see README."
+                )
         curated = extract_curated_contracts(document)
+        from .kpi import (
+            compile_kpi_sql, determine_scope, extract_kpi_contracts, kpi_parameters,
+            propose_kpi_plan, scope_table_id,
+        )
+        kpi_tables = extract_kpi_contracts(document, resources)
+        report["layer_status"] = {"00": "PENDING", "01": "PENDING", "02": "PENDING" if kpi_tables else "NOT_REQUESTED"}
+        landing_bucket, bucket_decision = approved_bucket(resources)
+        report["deployment_decisions"] = [bucket_decision] if bucket_decision else []
+        if target:
+            report["deployment_decisions"].append({
+                "decision": "Explicitly approved current ADC for this DEV test instead of the BRD service account.",
+                "brd_service_account": target, "execution_identity": "CURRENT_ADC",
+                "project": resources["Google Cloud project ID"],
+            })
         sources = discover_source_files(source_root)
         run_id, key, manifest = make_run_identity(sha256_file(brd), now.date(), sources)
         directory = output_root / "reports" / f"execution_{run_id}"
@@ -283,7 +329,7 @@ def execute(
         spec, _ = extract_pipeline_contract(
             brd, run_date=now.date(), run_id=run_id, idempotency_key=key, ingested_at_utc=now.isoformat(),
             project_id=resources["Google Cloud project ID"], location="US",
-            gcs_bucket=resources["GCS landing bucket"], dataset_00=resources["00 dataset"],
+            gcs_bucket=landing_bucket, dataset_00=resources["00 dataset"],
             dataset_00_is_approved=True, llm_provider=os.getenv("LLM_PROVIDER"),
             llm_model=os.getenv("LLM_MODEL"), llm_credential_configured=bool(os.getenv("LLM_API_KEY")),
         )
@@ -303,6 +349,17 @@ def execute(
             raise ContractBlocked("LLM plan identifies unsupported requirements or unresolved decisions; see plan.")
         report["steps"].append({"step": phase, "actor": "LLM + Python evidence/schema validation",
                                 "status": "PASS", "detail": plan.summary})
+        if kpi_tables:
+            phase = "LLM 02 KPI understanding and action planning"
+            kpi_plan, kpi_response = propose_kpi_plan(
+                document, kpi_tables, get_provider(spec.llm_provider, model=spec.llm_model or ""),
+            )
+            report["llm_02"] = {"response": kpi_response, "plan": kpi_plan.model_dump()}
+            report["kpi_contracts"] = [table.model_dump() for table in kpi_tables]
+            if kpi_plan.unresolved_decisions or kpi_plan.unsupported_requirements:
+                raise ContractBlocked("LLM KPI checklist has unresolved or unsupported requirements; see llm_02.")
+            report["steps"].append({"step": phase, "actor": "LLM + Python fingerprint/evidence/schema validator",
+                                    "status": "PASS", "detail": kpi_plan.summary})
         phase = "source validation"
         if any(path.suffix.lower() != ".csv" for path in sources):
             raise ContractBlocked("This BRD explicitly accepts CSV only; workbook inputs are not authorized.")
@@ -326,9 +383,24 @@ def execute(
         report["steps"].append({"step": phase, "actor": "Python validation", "status": "PASS",
                                 "detail": f"{sum(item.item.accepted_rows for item in prepared)} accepted rows."})
         phase = "SQL compilation"
-        sql = compile_transform_sql(spec, curated, resources["01 dataset"])
+        acceptance_sql = compile_transform_sql(spec, curated, resources["01 dataset"])
+        sql = compile_transform_sql(
+            spec, curated, resources["01 dataset"],
+            pending_scope_table=scope_table_id(resources) if kpi_tables else None,
+        )
         sql_path = write_sql(sql, output_root / "sql" / "01", f"01_rainfall_transform_{run_id}.sql")
         report["sql_files"] = [str(sql_path)]
+        kpi_sql = compile_kpi_sql(kpi_tables, resources) if kpi_tables else None
+        if kpi_sql:
+            from ..sql_generator.dsp import DSP_VERSION
+            report["dsp"] = {
+                "version": DSP_VERSION, "adaptation_approved": True,
+                "reference_sha256": sha256_file(PROJECT_ROOT / "templates/reference/dsp_v3.2.0.sql"),
+                "template_sha256": sha256_file(PROJECT_ROOT / "templates/02_dsp_cli.sql.j2"),
+            }
+            report["sql_files"].append(str(write_sql(
+                kpi_sql, output_root / "sql" / "02", f"02_rainfall_transform_{run_id}.sql",
+            )))
         report["steps"].append({"step": phase, "actor": "Python/Jinja compiler", "status": "PASS"})
         project = resources["Google Cloud project ID"]
         bq = bigquery.Client(project=project, location="US")
@@ -355,6 +427,21 @@ def execute(
             table.clustering_fields = cluster
             table.labels = LABELS
             wanted_tables.append((table, False))
+        for contract in kpi_tables:
+            table = bigquery.Table(contract.table_id, schema=[field_schema(column) for column in contract.columns])
+            table.time_partitioning = bigquery.TimePartitioning(
+                field=contract.partition_by, type_=contract.partition_granularity,
+            )
+            table.clustering_fields, table.labels = contract.cluster_by, LABELS
+            wanted_tables.append((table, False))
+        if kpi_tables:
+            pending = bigquery.Table(scope_table_id(resources), schema=[
+                bigquery.SchemaField("assessment_date", "DATE", mode="REQUIRED"),
+                bigquery.SchemaField("run_id", "STRING", mode="REQUIRED"),
+            ])
+            pending.time_partitioning = bigquery.TimePartitioning(field="assessment_date")
+            pending.labels = LABELS
+            wanted_tables.append((pending, False))
         for table, _ in wanted_tables:
             table_id = f"{table.project}.{table.dataset_id}.{table.table_id}"
             fields = [{
@@ -366,6 +453,7 @@ def execute(
             create_sql = SqlRenderer().render("managed_table.sql.j2", {
                 "brd_sha256": spec.brd_sha256, "table_id": table_id, "columns": fields,
                 "partition_by": table.time_partitioning.field if table.time_partitioning else None,
+                "partition_granularity": table.time_partitioning.type_ if table.time_partitioning else "DAY",
                 "cluster_by": table.clustering_fields or [],
             })
             report["sql_files"].append(str(write_sql(
@@ -380,7 +468,10 @@ def execute(
             else:
                 additions = schema_actions(existing, table, allow_nullable_additions=additions_allowed)
                 actions.append((table, additions))
-        for dataset_id in (resources["00 dataset"], resources["01 dataset"]):
+        dataset_ids = [resources["00 dataset"], resources["01 dataset"]]
+        if kpi_tables:
+            dataset_ids.append(resources["02 dataset"])
+        for dataset_id in dataset_ids:
             try:
                 existing_dataset = bq.get_dataset(f"{project}.{dataset_id}")
             except NotFound:
@@ -397,8 +488,12 @@ def execute(
             or bucket.iam_configuration.public_access_prevention != "enforced"
         ):
             raise ContractBlocked("Existing bucket does not satisfy BRD location/access protections.")
+        if bucket is not None and bucket_decision and not any(
+            candidate.name == bucket.name for candidate in gcs.list_buckets(prefix=bucket.name)
+        ):
+            raise ContractBlocked("Approved deployment bucket does not belong to the authorized project.")
         report["schema_actions"] = [
-            {"table": table.full_table_id, "action": "CREATE" if additions is None else (
+            {"table": f"{table.project}.{table.dataset_id}.{table.table_id}", "action": "CREATE" if additions is None else (
                 "ADD_NULLABLE_COLUMNS" if additions else "REUSE"
             ), "additions": [field.name for field in additions or []]}
             for table, additions in actions
@@ -408,7 +503,7 @@ def execute(
             report["status"] = "DRY_RUN_READY"
             return report
         phase = "BRD analytical acceptance examples"
-        report["analytical_acceptance"] = verify_analytical_examples(bq, sql, project, spec.dataset_00)
+        report["analytical_acceptance"] = verify_analytical_examples(bq, acceptance_sql, project, spec.dataset_00)
         report["steps"].append({"step": phase, "actor": "Python/BigQuery temporary fixtures", "status": "PASS",
                                 "detail": "60 mm WARNING, absent-day INCOMPLETE, 75% gate, exact 80% boundary."})
         phase = "bucket provisioning"
@@ -426,7 +521,7 @@ def execute(
             content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ))
         phase = "managed table provisioning"
-        for dataset_id in (resources["00 dataset"], resources["01 dataset"]):
+        for dataset_id in dataset_ids:
             dataset = bigquery.Dataset(f"{project}.{dataset_id}")
             dataset.location = "US"
             dataset.labels = LABELS
@@ -434,14 +529,16 @@ def execute(
         for table, additions in actions:
             if additions is None:
                 bq.create_table(table)
-                report["cloud_mutations"].append({"action": "CREATE_NATIVE_TABLE", "table": table.full_table_id})
+                report["cloud_mutations"].append({
+                    "action": "CREATE_NATIVE_TABLE", "table": f"{table.project}.{table.dataset_id}.{table.table_id}",
+                })
             elif additions:
                 for field in additions:
                     query = f"ALTER TABLE `{table.project}.{table.dataset_id}.{table.table_id}` ADD COLUMN IF NOT EXISTS `{field.name}` {field.field_type}"
                     bq.query(query, location="US").result()
                 report["cloud_mutations"].append({"action": "ADD_NULLABLE_COLUMNS", "table": table.full_table_id})
         report["steps"].append({"step": phase, "actor": "Python/BigQuery", "status": "PASS",
-                                "detail": "Seven managed tables created or schema-checked; no replacement."})
+                                "detail": f"{len(wanted_tables)} managed tables created or checked; no replacement."})
         phase = "source upload and managed 00 loading"
         for source in prepared:
             feed = next(feed for feed in spec.feeds if feed.feed_id == source.feed_id)
@@ -461,6 +558,7 @@ def execute(
             write_report(report, directory)
         report["steps"].append({"step": phase, "actor": "Python/GCS/BigQuery load jobs", "status": "PASS",
                                 "detail": "Metadata added outside source contract; atomic append jobs reused on retry."})
+        report["layer_status"]["00"] = "SUCCESS"
         phase = "analytical 01 dry-run and atomic publication"
         query_config = bigquery.QueryJobConfig(
             query_parameters=[
@@ -468,6 +566,13 @@ def execute(
                 bigquery.ScalarQueryParameter("transformed_at", "TIMESTAMP", now),
             ], maximum_bytes_billed=1024**3, labels=LABELS,
         )
+        if kpi_tables:
+            query_config.query_parameters = [
+                *query_config.query_parameters,
+                bigquery.ScalarQueryParameter("bootstrap_02", "BOOL", any(
+                    table.table_id.startswith("02_") and additions is None for table, additions in actions
+                )),
+            ]
         validation_config = bigquery.QueryJobConfig(
             query_parameters=query_config.query_parameters, dry_run=True, use_query_cache=False,
             maximum_bytes_billed=1024**3, labels=LABELS,
@@ -477,8 +582,8 @@ def execute(
                                   "note": "BigQuery script dry-run does not validate every temporary-table statement."}
         # A new attempt may retry a previously failed script; successful scripts are replay-safe MERGEs.
         job = bq.query(sql, job_config=query_config, location="US")
-        counts = list(job.result())
         report["jobs"].append({"phase": "01", "job_id": job.job_id})
+        counts = list(job.result())
         report["merge_statistics"] = []
         for child in bq.list_jobs(parent_job=job.job_id):
             if child.statement_type == "MERGE":
@@ -493,6 +598,24 @@ def execute(
         report["row_counts"].update({row["table_name"]: row["row_count"] for row in counts})
         report["steps"].append({"step": phase, "actor": "Python/BigQuery verified template",
                                 "status": "PASS", "detail": "All four outputs validated then MERGEd atomically."})
+        report["layer_status"]["01"] = "SUCCESS"
+        if kpi_tables and kpi_sql:
+            phase = "02 scoped staging, validation and atomic publication"
+            scope = determine_scope(bq, kpi_tables, resources)
+            report["kpi_scope"] = scope
+            parameters_02 = kpi_parameters(scope, now.date(), now)
+            config_02 = bigquery.QueryJobConfig(
+                query_parameters=parameters_02, maximum_bytes_billed=1024**3, labels=LABELS,
+            )
+            kpi_job = bq.query(kpi_sql, job_config=config_02, location="US")
+            report["jobs"].append({"phase": "02", "job_id": kpi_job.job_id})
+            failures = [dict(row) for row in kpi_job.result()]
+            report["kpi_validation_failures"] = failures
+            if failures:
+                raise ContractBlocked("02 validation failed; all four prior KPI outputs preserved; see keyed diagnostics.")
+            report["steps"].append({"step": phase, "actor": "Python/BigQuery DSP CLI adaptation",
+                                    "status": "PASS", "detail": "Four validated KPI tables published atomically."})
+            report["layer_status"]["02"] = "SUCCESS"
         phase = "post-execution reconciliation"
         for table, _ in wanted_tables:
             actual = bq.get_table(table)
@@ -505,31 +628,45 @@ def execute(
         ).result()
         report["affected_observation_range"] = [dict(row) for row in dates]
         report["steps"].append({"step": phase, "actor": "Python/BigQuery read-only metadata",
-                                "status": "PASS", "detail": "Seven native table schemas, layouts and row counts verified."})
+                                "status": "PASS", "detail": f"{len(wanted_tables)} native table schemas, layouts and counts verified."})
         if verify_retry:
             phase = "unchanged-input idempotency verification"
             retry_parameters = [
                 bigquery.ScalarQueryParameter("run_date", "DATE", now.date()),
                 bigquery.ScalarQueryParameter("transformed_at", "TIMESTAMP", datetime.now(timezone.utc)),
             ]
+            if kpi_tables:
+                retry_parameters.append(bigquery.ScalarQueryParameter("bootstrap_02", "BOOL", False))
             report["idempotency_verification"] = verify_unchanged_retry(bq, sql, retry_parameters, 4)
+            if kpi_tables and kpi_sql:
+                # Replay the same full scope, not an empty-scope no-op, to verify formulas and ranks.
+                report["idempotency_verification_02"] = verify_unchanged_retry(
+                    bq, kpi_sql, kpi_parameters(scope, now.date(), datetime.now(timezone.utc)), 4,
+                )
             report["steps"].append({"step": phase, "actor": "Python/BigQuery actual retry", "status": "PASS",
                                     "detail": "Four MERGEs: zero inserted, updated or deleted rows."})
         report["status"] = "SUCCESS"
         phase = "report publication"
-        write_report(report, directory)
         attempt_prefix = f"run_reports/{run_id}/attempts/{now:%Y%m%dT%H%M%S%f}"
-        for filename, content_type in (("run_report.json", "application/json"), ("run_report.md", "text/markdown")):
-            ensure_object(bucket, f"{attempt_prefix}/{filename}", (directory / filename).read_bytes(), content_type=content_type)
         report["report_gcs_prefix"] = f"gs://{bucket.name}/{attempt_prefix}/"
         report["steps"].append({"step": phase, "actor": "Python/GCS", "status": "PASS"})
+        write_report(report, directory)
+        for filename, content_type in (("run_report.json", "application/json"), ("run_report.md", "text/markdown")):
+            ensure_object(bucket, f"{attempt_prefix}/{filename}", (directory / filename).read_bytes(), content_type=content_type)
     except (ContractBlocked, ValueError, LLMError, GoogleAPICallError, GoogleAuthError, OSError) as error:
         report["status"] = "BLOCKED" if isinstance(error, ContractBlocked) else "FAILED"
+        if report.get("layer_status", {}).get("02") == "PENDING":
+            report["layer_status"]["02"] = "FAILED" if phase.startswith("02 ") else "BLOCKED"
         if isinstance(error, (ContractBlocked, ValueError)) and not isinstance(error, LLMError):
             reason = str(error)
         else:
             reason = f"{type(error).__name__}: upstream details withheld to protect credentials."
             if isinstance(error, GoogleAPICallError):
+                location = re.search(r"at \[(\d+):(\d+)\]", str(error))
+                if location:
+                    reason += f" Generated SQL line {location[1]}, column {location[2]}; inspect the recorded job ID."
+                if "Query exceeded limit for bytes billed" in str(error):
+                    reason += " Query cost cap reached; optimize the statement plan before requesting a larger budget."
                 # Only our controlled SQL assertion strings, never arbitrary upstream content.
                 for marker in (
                     "BLOCKED: observation", "BLOCKED: missing", "BLOCKED: multiple", "BLOCKED: snapshot",

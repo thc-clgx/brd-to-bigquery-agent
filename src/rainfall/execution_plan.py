@@ -125,6 +125,7 @@ def validate_execution_plan(
 
 def compile_transform_sql(
     spec: RainfallPipelineSpec, curated: list[CuratedTable], dataset_01: str,
+    *, pending_scope_table: str | None = None,
 ) -> str:
     validations, merges = [], []
     for table in curated:
@@ -171,10 +172,15 @@ def compile_transform_sql(
         "ASSERT NOT EXISTS (SELECT 1 FROM build_coverage WHERE usable_station_count > expected_station_count "
         "OR station_coverage_pct < 0 OR station_coverage_pct > 100) AS 'FAILED: coverage reconciliation';",
     ])
+    scope_capture, scope_publication = "", ""
+    if pending_scope_table:
+        from .kpi import capture_scope_sql
+        scope_capture, scope_publication = capture_scope_sql(curated, pending_scope_table, spec.run_id)
     sql = SqlRenderer().render("01_rainfall_transform.sql.j2", {
         "project": spec.project_id, "dataset_00": spec.dataset_00, "dataset_01": dataset_01,
         "brd_sha256": spec.brd_sha256, "run_id": spec.run_id,
         "validation_sql": "\n".join(validations), "merge_sql": "\n\n".join(merges),
+        "scope_capture": scope_capture, "scope_publication": scope_publication,
     })
     if "{{" in sql or "{%" in sql:
         raise ValueError("Unresolved SQL template placeholder.")

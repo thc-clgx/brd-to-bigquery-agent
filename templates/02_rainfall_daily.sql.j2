@@ -1,0 +1,60 @@
+WITH matched AS (
+  SELECT watershed_id, assessment_date, rolling_window_days,
+    COUNT(*) AS assessment_row_count,
+    COUNTIF(assessment_status IN ('ASSESSED', 'NO_THRESHOLD')) AS assessable_station_count,
+    COUNTIF(assessment_status = 'INCOMPLETE') AS incomplete_station_count,
+    COUNTIF(assessment_status = 'NOT_ASSESSED') AS not_assessed_station_count,
+    COUNTIF(threshold_category = 'WATCH') AS watch_station_count,
+    COUNTIF(threshold_category = 'WARNING') AS warning_station_count,
+    COUNTIF(threshold_category = 'ALERT') AS alert_station_count,
+    ARRAY_AGG(DISTINCT IF(threshold_category IN ('WARNING', 'ALERT'), station_id, NULL)
+      IGNORE NULLS ORDER BY IF(threshold_category IN ('WARNING', 'ALERT'), station_id, NULL))
+      AS warning_or_alert_station_ids,
+    MAX(CASE threshold_category WHEN 'ALERT' THEN 5 WHEN 'WARNING' THEN 4 WHEN 'WATCH' THEN 3
+      WHEN 'NO_THRESHOLD' THEN 2 WHEN 'NOT_ASSESSED' THEN 1 ELSE 0 END) AS category_rank,
+    MAX(minimum_station_coverage_pct) AS same_date_minimum,
+    MAX(IF(window_complete, rolling_rainfall_mm, NULL)) AS max_station_rolling_rainfall_mm,
+    MAX(IF(threshold_category IN ('WARNING', 'ALERT'), rolling_rainfall_mm, NULL))
+      AS max_warning_or_alert_rolling_rainfall_mm,
+    MAX(transform_run_date) AS assessment_transform_run_date
+  FROM `{{ project }}.{{ dataset_01 }}.01_fact_station_rainfall_assessment`
+  WHERE DATE_TRUNC(assessment_date, MONTH) IN UNNEST(@affected_months)
+  GROUP BY watershed_id, assessment_date, rolling_window_days
+), month_minimum AS (
+  SELECT watershed_id, DATE_TRUNC(assessment_date, MONTH) AS month_start_date,
+    rolling_window_days, MAX(minimum_station_coverage_pct) AS minimum_pct
+  FROM `{{ project }}.{{ dataset_01 }}.01_fact_station_rainfall_assessment`
+  WHERE DATE_TRUNC(assessment_date, MONTH) IN UNNEST(@affected_months)
+  GROUP BY watershed_id, month_start_date, rolling_window_days
+)
+SELECT c.watershed_id, c.watershed_label, c.region_code, c.assessment_date, window_days AS rolling_window_days,
+  c.expected_station_count, c.usable_station_count, c.station_coverage_pct,
+  COALESCE(a.same_date_minimum, m.minimum_pct) AS minimum_station_coverage_pct,
+  CASE WHEN a.same_date_minimum IS NOT NULL THEN 'SAME_DATE'
+    WHEN m.minimum_pct IS NOT NULL THEN 'SAME_MONTH_FALLBACK' ELSE 'UNAVAILABLE' END AS minimum_coverage_source,
+  IFNULL(c.station_coverage_pct < COALESCE(a.same_date_minimum, m.minimum_pct), FALSE) AS coverage_below_minimum_flag,
+  p.station_coverage_pct AS previous_day_coverage_pct,
+  ROUND(c.station_coverage_pct - p.station_coverage_pct, 2) AS coverage_change_pct_points,
+  IFNULL(a.assessment_row_count, 0) AS assessment_row_count,
+  IFNULL(a.assessable_station_count, 0) AS assessable_station_count,
+  IFNULL(a.incomplete_station_count, 0) AS incomplete_station_count,
+  IFNULL(a.not_assessed_station_count, 0) AS not_assessed_station_count,
+  IFNULL(a.watch_station_count, 0) AS watch_station_count,
+  IFNULL(a.warning_station_count, 0) AS warning_station_count,
+  IFNULL(a.alert_station_count, 0) AS alert_station_count,
+  IFNULL(a.watch_station_count + a.warning_station_count + a.alert_station_count, 0) AS threshold_reached_station_count,
+  IFNULL(a.warning_or_alert_station_ids, ARRAY<STRING>[]) AS warning_or_alert_station_ids,
+  CASE a.category_rank WHEN 5 THEN 'ALERT' WHEN 4 THEN 'WARNING' WHEN 3 THEN 'WATCH'
+    WHEN 2 THEN 'NO_THRESHOLD' WHEN 1 THEN 'NOT_ASSESSED' ELSE 'NO_ASSESSMENT_ROW' END AS highest_threshold_category,
+  a.max_station_rolling_rainfall_mm, a.max_warning_or_alert_rolling_rainfall_mm,
+  c.transform_run_date AS coverage_transform_run_date, a.assessment_transform_run_date,
+  @run_date AS transform_run_date, @transformed_at AS transformed_at
+FROM `{{ project }}.{{ dataset_01 }}.01_fact_watershed_station_coverage` c
+CROSS JOIN UNNEST([1, 3, 7]) window_days
+LEFT JOIN matched a ON a.watershed_id = c.watershed_id AND a.assessment_date = c.assessment_date
+  AND a.rolling_window_days = window_days
+LEFT JOIN month_minimum m ON m.watershed_id = c.watershed_id
+  AND m.month_start_date = DATE_TRUNC(c.assessment_date, MONTH) AND m.rolling_window_days = window_days
+LEFT JOIN `{{ project }}.{{ dataset_01 }}.01_fact_watershed_station_coverage` p
+  ON p.watershed_id = c.watershed_id AND p.assessment_date = DATE_SUB(c.assessment_date, INTERVAL 1 DAY)
+WHERE DATE_TRUNC(c.assessment_date, MONTH) IN UNNEST(@affected_months)
